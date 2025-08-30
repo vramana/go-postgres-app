@@ -1,14 +1,18 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"strconv"
-	"time"
+    "bytes"
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "log/slog"
+    "math/rand"
+    "net/http"
+    "os"
+    "strconv"
+    "time"
+    "strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
@@ -55,31 +59,40 @@ func main() {
 		log.Fatalf("migrate: %v", err)
 	}
 
-	srv := &Server{db: pool}
+    srv := &Server{db: pool}
+
+    // Bootstrap students if empty
+    if err := bootstrapStudents(ctx, pool, 100); err != nil {
+        log.Fatalf("bootstrap students: %v", err)
+    }
 
 	mux := http.NewServeMux()
 
-    routes := []struct{ method, path string }{
-        {http.MethodGet, "/healthz"},
-        {http.MethodPost, "/students"},
-        {http.MethodGet, "/students"},
-        {http.MethodGet, "/students/{id}"},
-        {http.MethodDelete, "/students/{id}"},
-        {http.MethodPost, "/attendances"},
-        {http.MethodGet, "/attendances"},
-    }
-    mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("ok")) })
-    mux.HandleFunc("/students", srv.handleStudents)
-    mux.HandleFunc("/students/", srv.handleStudentByID)
-    mux.HandleFunc("/attendances", srv.handleAttendances)
-
-	addr := getenv("HTTP_ADDR", ":8080")
-	log.Printf("listening on %s", addr)
-	log.Println("routes:")
-    for _, r := range routes { log.Printf("  %s %s", r.method, r.path) }
-	if err := http.ListenAndServe(addr, logRequest(mux)); err != nil {
-		log.Fatal(err)
+	routes := []struct{ method, path string }{
+		{http.MethodGet, "/healthz"},
+		{http.MethodPost, "/students"},
+		{http.MethodGet, "/students"},
+		{http.MethodGet, "/students/{id}"},
+		{http.MethodDelete, "/students/{id}"},
+		{http.MethodPost, "/attendances"},
+		{http.MethodGet, "/attendances"},
 	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("ok")) })
+	mux.HandleFunc("/students", srv.handleStudents)
+	mux.HandleFunc("/students/", srv.handleStudentByID)
+	mux.HandleFunc("/attendances", srv.handleAttendances)
+
+    addr := getenv("HTTP_ADDR", ":8080")
+    logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+    logger.Info("listening", slog.String("addr", addr))
+    logger.Info("routes")
+    for _, r := range routes { logger.Info("route", slog.String("method", r.method), slog.String("path", r.path)) }
+
+	// Start background job to randomly mark attendance
+	go startRandomAttendanceJob(context.Background(), srv)
+    if err := http.ListenAndServe(addr, slogRequest(logger, mux)); err != nil {
+        log.Fatal(err)
+    }
 }
 
 func getenv(k, d string) string {
@@ -89,12 +102,16 @@ func getenv(k, d string) string {
 	return d
 }
 
-func logRequest(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
-	})
+type statusRecorder struct { http.ResponseWriter; status int }
+func (sr *statusRecorder) WriteHeader(code int) { sr.status = code; sr.ResponseWriter.WriteHeader(code) }
+
+func slogRequest(l *slog.Logger, next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        sr := &statusRecorder{ResponseWriter: w, status: 200}
+        next.ServeHTTP(sr, r)
+        l.Info("request", slog.String("method", r.Method), slog.String("path", r.URL.Path), slog.Int("status", sr.status), slog.Int64("dur_ms", time.Since(start).Milliseconds()))
+    })
 }
 
 func migrate(ctx context.Context, db *pgxpool.Pool) error {
@@ -260,7 +277,64 @@ func appendWhere(where, cond string) string {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    _ = json.NewEncoder(w).Encode(v)
+}
+
+func bootstrapStudents(ctx context.Context, db *pgxpool.Pool, n int) error {
+    var cnt int
+    if err := db.QueryRow(ctx, "SELECT COUNT(*) FROM students").Scan(&cnt); err != nil {
+        return err
+    }
+    if cnt > 0 {
+        return nil
+    }
+    batch := make([]string, 0, n)
+    for i := 1; i <= n; i++ {
+        batch = append(batch, fmt.Sprintf("('%s')", fmt.Sprintf("Student %03d", i)))
+    }
+    _, err := db.Exec(ctx, "INSERT INTO students(name) VALUES "+strings.Join(batch, ","))
+    return err
+}
+
+// Background job: periodically picks a random student and records attendance via HTTP
+func startRandomAttendanceJob(ctx context.Context, s *Server) {
+	intervalStr := getenv("RANDOM_ATT_INTERVAL", "500ms")
+	interval, err := time.ParseDuration(intervalStr)
+	if err != nil {
+		interval = 30 * time.Second
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	rand.Seed(time.Now().UnixNano())
+	statuses := []string{"present", "absent", "late"}
+	for {
+		select {
+		case <-time.After(interval):
+			// pick a random student id from DB
+			var id int64
+			err := s.db.QueryRow(context.Background(), "SELECT id FROM students ORDER BY random() LIMIT 1").Scan(&id)
+			if err != nil {
+				// nothing to do if no students yet
+				continue
+			}
+			status := statuses[rand.Intn(len(statuses))]
+			// call internal HTTP endpoint
+			body := fmt.Sprintf(`{"student_id":%d,"status":"%s"}`, id, status)
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, getenv("INTERNAL_BASE_URL", "http://127.0.0.1:8080")+"/attendances",
+				bytes.NewBufferString(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				log.Printf("random attendance: request error: %v", err)
+				continue
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				log.Printf("random attendance: unexpected status %d", resp.StatusCode)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
