@@ -36,6 +36,7 @@ publish:
 		echo ':: No local changes to commit'
 	fi
 	echo ':: Pushing current change via jj'
+	jj bookmark set master -r @-
 	jj git push
 
 # 3) Remote build image and push to registry (must be logged in on VM)
