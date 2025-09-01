@@ -1,0 +1,12 @@
+**/.git
+**/.jj
+**/.env
+**/.DS_Store
+**/node_modules
+**/dist
+**/build
+# Ignore only the root-level built binary, not cmd/server
+/server
+*.tar.gz
+*.tgz
+*.zip

@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-postgres-app
+  labels:
+    app: go-postgres-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: go-postgres-app
+  template:
+    metadata:
+      labels:
+        app: go-postgres-app
+    spec:
+      containers:
+        - name: app
+          image: go-postgres-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # Use CloudNativePG service name for the cluster
+            - name: POSTGRES_HOST
+              value: pg-demo-rw
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: appdb
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: pg-demo-superuser
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pg-demo-superuser
+                  key: password
+            - name: HTTP_ADDR
+              value: ":8080"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10

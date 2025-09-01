@@ -563,80 +563,85 @@ func startRandomAttendanceJob(ctx context.Context, s *Server) {
 	if err != nil {
 		interval = 30 * time.Second
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	statuses := []string{"present", "absent", "late"}
-	for {
-		select {
-		case <-time.After(interval):
-			// ensure at least 3 classes
-			_, _ = s.db.Exec(ctx, "INSERT INTO classes(name) VALUES('Class A') ON CONFLICT DO NOTHING")
-			_, _ = s.db.Exec(ctx, "INSERT INTO classes(name) VALUES('Class B') ON CONFLICT DO NOTHING")
-			_, _ = s.db.Exec(ctx, "INSERT INTO classes(name) VALUES('Class C') ON CONFLICT DO NOTHING")
-			// enroll students evenly
-			rows, _ := s.db.Query(ctx, "SELECT id FROM students")
-			var ids []int64
-			for rows != nil && rows.Next() {
-				var x int64
-				_ = rows.Scan(&x)
-				ids = append(ids, x)
-			}
-			if rows != nil {
-				rows.Close()
-			}
-			// fetch class ids
-			crows, _ := s.db.Query(ctx, "SELECT id FROM classes ORDER BY id LIMIT 3")
-			classIDs := []int64{}
-			for crows != nil && crows.Next() {
-				var x int64
-				_ = crows.Scan(&x)
-				classIDs = append(classIDs, x)
-			}
-			if crows != nil {
-				crows.Close()
-			}
-			for i, sid := range ids {
-				if len(classIDs) == 0 {
-					break
-				}
-				cid := classIDs[i%len(classIDs)]
-				_, _ = s.db.Exec(ctx, "INSERT INTO enrollments(student_id, class_id) VALUES($1,$2) ON CONFLICT DO NOTHING", sid, cid)
-			}
-			// create today's sessions for each class, periods 1-3
-			today := time.Now().Format("2006-01-02")
-			for _, cid := range classIDs {
-				for p := 1; p <= 3; p++ {
-					_, _ = s.db.Exec(ctx, "INSERT INTO sessions(class_id, date, period) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", cid, today, p)
-				}
-			}
-			// pick random session and a student enrolled in that class
-			var sessionID, classID int64
-			err := s.db.QueryRow(ctx, "SELECT id, class_id FROM sessions ORDER BY random() LIMIT 1").Scan(&sessionID, &classID)
-			if err != nil {
-				// nothing to do if no students yet
-				continue
-			}
-			var studentID int64
-			err = s.db.QueryRow(ctx, "SELECT student_id FROM enrollments WHERE class_id=$1 ORDER BY random() LIMIT 1", classID).Scan(&studentID)
-			if err != nil {
-				continue
-			}
-			status := statuses[int(time.Now().UnixNano())%len(statuses)]
-			// call internal HTTP endpoint
-			body := fmt.Sprintf(`{"student_id":%d,"status":"%s","session_id":%d}`, studentID, status, sessionID)
-			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, getenv("INTERNAL_BASE_URL", "http://127.0.0.1:8080")+"/attendances",
-				bytes.NewBufferString(body))
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("random attendance: request error: %v", err)
-				continue
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode >= 300 {
-				log.Printf("random attendance: unexpected status %d", resp.StatusCode)
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
+    client := &http.Client{Timeout: 5 * time.Second}
+    statuses := []string{"present", "absent", "late"}
+    base := getenv("INTERNAL_BASE_URL", "http://127.0.0.1:8080")
+    for {
+        select {
+        case <-time.After(interval):
+            // call all endpoints
+            // Students
+            _ = httpPostJSON(ctx, client, base+"/students", map[string]string{"name": fmt.Sprintf("Auto %d", time.Now().UnixNano()%1_000_000)}, nil)
+            var students []Student
+            _ = httpGetJSON(ctx, client, base+"/students", &students)
+
+            // Classes
+            _ = httpPostJSON(ctx, client, base+"/classes", map[string]string{"name": fmt.Sprintf("Class %d", (time.Now().UnixNano()/1e6)%1000)}, nil)
+            var classes []Class
+            _ = httpGetJSON(ctx, client, base+"/classes", &classes)
+            if len(classes) > 0 {
+                c := classes[pickIndex(len(classes))]
+                _ = httpGet(ctx, client, fmt.Sprintf("%s/classes/%d", base, c.ID))
+                _ = httpGet(ctx, client, fmt.Sprintf("%s/classes/%d/students", base, c.ID))
+                if len(students) > 0 {
+                    st := students[pickIndex(len(students))]
+                    _ = httpPostJSON(ctx, client, fmt.Sprintf("%s/classes/%d/enroll", base, c.ID), map[string]int64{"student_id": st.ID}, nil)
+                }
+            }
+
+            // Sessions
+            if len(classes) > 0 {
+                c := classes[pickIndex(len(classes))]
+                today := time.Now().Format("2006-01-02")
+                _ = httpPostJSON(ctx, client, base+"/sessions", map[string]any{"class_id": c.ID, "date": today, "period": int(time.Now().UnixNano()%3)+1}, nil)
+            }
+            var sessions []Session
+            _ = httpGetJSON(ctx, client, base+"/sessions", &sessions)
+
+            // Attendances
+            _ = httpGet(ctx, client, base+"/attendances")
+            if len(students) > 0 && len(sessions) > 0 {
+                st := students[pickIndex(len(students))]
+                se := sessions[pickIndex(len(sessions))]
+                status := statuses[pickIndex(len(statuses))]
+                _ = httpPostJSON(ctx, client, base+"/attendances", map[string]any{"student_id": st.ID, "status": status, "session_id": se.ID}, nil)
+            }
+        case <-ctx.Done():
+            return
+        }
+    }
 }
+
+func httpGet(ctx context.Context, client *http.Client, url string) error {
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    resp, err := client.Do(req)
+    if err != nil { return err }
+    _ = resp.Body.Close()
+    if resp.StatusCode >= 400 { return fmt.Errorf("GET %s -> %d", url, resp.StatusCode) }
+    return nil
+}
+
+func httpGetJSON(ctx context.Context, client *http.Client, url string, out any) error {
+    req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    resp, err := client.Do(req)
+    if err != nil { return err }
+    defer resp.Body.Close()
+    if resp.StatusCode >= 400 { return fmt.Errorf("GET %s -> %d", url, resp.StatusCode) }
+    if out == nil { return nil }
+    return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func httpPostJSON(ctx context.Context, client *http.Client, url string, body any, out any) error {
+    var buf bytes.Buffer
+    if body != nil { _ = json.NewEncoder(&buf).Encode(body) }
+    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+    req.Header.Set("Content-Type", "application/json")
+    resp, err := client.Do(req)
+    if err != nil { return err }
+    defer resp.Body.Close()
+    if resp.StatusCode >= 400 { return fmt.Errorf("POST %s -> %d", url, resp.StatusCode) }
+    if out == nil { return nil }
+    return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func pickIndex(n int) int { if n <= 1 { return 0 }; return int(time.Now().UnixNano()%int64(n)) }
